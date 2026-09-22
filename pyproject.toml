@@ -9,3 +9,18 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+log_cli = false
+log_level = "INFO"
+log_file = "test-output.log"
+log_file_level = "INFO"
+log_file_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+junit_family = "xunit2"

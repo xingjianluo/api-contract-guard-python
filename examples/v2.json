@@ -1,0 +1,23 @@
+{
+  "paths": {
+    "/users": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {"application/json": {"schema": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {
+                "id": {"type": "string"},
+                "name": {"type": "string", "enum": ["free", "pro", "enterprise"]}
+              }
+            }}}
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {"responses": {"200": {"content": {"application/json": {"schema": {"type": "object"}}}}}}
+    }
+  }
+}

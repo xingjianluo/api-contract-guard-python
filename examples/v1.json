@@ -1,0 +1,21 @@
+{
+  "paths": {
+    "/users": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {"application/json": {"schema": {
+              "type": "object",
+              "required": ["id", "name"],
+              "properties": {
+                "id": {"type": "integer"},
+                "name": {"type": "string", "enum": ["free", "pro"]},
+                "nickname": {"type": "string", "nullable": true}
+              }
+            }}}
+          }
+        }
+      }
+    }
+  }
+}

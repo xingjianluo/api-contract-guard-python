@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
-app = FastAPI()
+from app.contractguard.http_api import create_app
+
+app = create_app()
 
 
 @app.get("/")
