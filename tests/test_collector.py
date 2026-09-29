@@ -124,7 +124,11 @@ def test_collect_normalizes_order_and_is_deterministic() -> None:
 
     # 字典序："/users" 是 "/users/{id}" 的前缀，故在前
     assert endpoint_names == [("POST", "/users"), ("GET", "/users/{id}")]
-    resp_fields = snap_a.endpoints[1].response_fields
+    success_200 = next(
+        r for r in snap_a.endpoints[1].responses if r.status == "200"
+    )
+    resp_fields = success_200.fields
+    assert [r.status for r in snap_a.endpoints[1].responses] == ["200"]
     assert [f.name for f in resp_fields] == ["id", "name", "role"]
     assert tuple(resp_fields[2].enum) == ("admin", "guest", "user")
     assert snap_a.fingerprint == snap_b.fingerprint == snap_text.fingerprint == snap_bytes.fingerprint

@@ -133,3 +133,99 @@ def test_baselines_listed_sorted(client: TestClient) -> None:
     versions = [b["version"] for b in resp.json()["baselines"]]
     logger.info("基线列表排序: %s", versions)
     assert versions == ["1.0.2", "1.0.10"]
+
+
+# --------------------------------------------------------------------------- #
+# 多响应结果 + 字段级依赖（新能力 HTTP 端到端）
+# --------------------------------------------------------------------------- #
+
+
+def _multi_response_contract(*, keep_name: bool) -> dict:
+    from tests.contract_factory import contract_with_responses, json_response
+    props = {"id": {"type": "integer"}}
+    if keep_name:
+        props["name"] = {"type": "string"}
+    return contract_with_responses({
+        "200": json_response("200", props, required=["id"] + (["name"] if keep_name else [])),
+        "404": json_response("404", {"message": {"type": "string"}}),
+    })
+
+
+def test_field_level_dependency_unused_breaking_warns(client: TestClient) -> None:
+    v1 = _multi_response_contract(keep_name=True)
+    v2 = _multi_response_contract(keep_name=False)
+    _post_baseline(client, "1.0.0", v1)
+    rc = client.post("/services/svc/consumers/web", json={
+        "operations": [],
+        "dependencies": [
+            {"operation": "GET /users", "response": "200", "fields": ["id"]}
+        ],
+    })
+    assert rc.status_code == 201, rc.text
+    _post_baseline(client, "2.0.0", v2)
+
+    gate = client.get("/services/svc/release-check/1.0.0/2.0.0").json()
+    logger.info("字段级依赖(只依赖id, name被删) -> %s", gate)
+    assert gate["verdict"] == "warn"
+    finding = gate["findings"][0]
+    assert finding["reason_code"] == "breaking_operation_only"
+    assert finding["consumers"] == ["web"]
+
+
+def test_field_level_dependency_hit_rejects(client: TestClient) -> None:
+    v1 = _multi_response_contract(keep_name=True)
+    v2 = _multi_response_contract(keep_name=False)
+    _post_baseline(client, "1.0.0", v1)
+    rc = client.post("/services/svc/consumers/web", json={
+        "operations": ["GET /users"],
+        "dependencies": [
+            {"operation": "GET /users", "response": "200", "fields": ["name"]}
+        ],
+    })
+    assert rc.status_code == 201
+    _post_baseline(client, "2.0.0", v2)
+
+    gate = client.get("/services/svc/release-check/1.0.0/2.0.0").json()
+    assert gate["verdict"] == "reject"
+    assert gate["findings"][0]["reason_code"] == "breaking_consumer_affected"
+    assert gate["findings"][0]["consumers"] == ["web"]
+
+
+@pytest.mark.parametrize("dependency, expected_prefix", [
+    ({"operation": "GET /ghost", "response": "200", "fields": ["id"]},
+     "unknown_consumer_operation"),
+    ({"operation": "GET /users", "response": "503", "fields": ["id"]},
+     "unknown_consumer_response"),
+    ({"operation": "GET /users", "response": "200", "fields": ["ghost"]},
+     "unknown_consumer_field"),
+])
+def test_invalid_dependency_rejected_with_distinguishable_code(
+        client: TestClient, dependency: dict, expected_prefix: str) -> None:
+    _post_baseline(client, "1.0.0", _multi_response_contract(keep_name=True))
+    resp = client.post("/services/svc/consumers/web",
+                       json={"operations": [], "dependencies": [dependency]})
+    logger.info("非法依赖 %s -> HTTP %s %s", dependency, resp.status_code, resp.json())
+    assert resp.status_code == 422
+    assert resp.json()["error"]["message"].startswith(expected_prefix)
+
+
+def test_response_removal_shown_in_diff_and_scoped_gate(client: TestClient) -> None:
+    v1 = _multi_response_contract(keep_name=True)
+    v2 = _multi_response_contract(keep_name=True)
+    # v2 删掉 404
+    v2["paths"]["/users"]["get"]["responses"].pop("404")
+    _post_baseline(client, "1.0.0", v1)
+    client.post("/services/svc/consumers/ok-only", json={
+        "operations": [],
+        "dependencies": [{"operation": "GET /users", "response": "200", "fields": ["id"]}],
+    })
+    _post_baseline(client, "2.0.0", v2)
+
+    diff = client.get("/services/svc/diff/1.0.0/2.0.0").json()
+    assert any(c["reason_code"] == "response_removed" for c in diff["changes"])
+    gate = client.get("/services/svc/release-check/1.0.0/2.0.0").json()
+    finding = next(f for f in gate["findings"]
+                   if f["change"]["reason_code"] == "response_removed")
+    # 消费者只依赖 200，不依赖 404 -> 仅操作命中，warn
+    assert finding["reason_code"] == "breaking_operation_only"
+    assert gate["verdict"] == "warn"

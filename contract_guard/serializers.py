@@ -11,15 +11,17 @@ from typing import Any
 from .errors import StorageCorruptionError
 from .models import (
     Baseline,
+    ConsumerDependency,
     ConsumerExpectation,
     ContractSnapshot,
     Direction,
     EndpointModel,
     FieldModel,
     ParameterLocation,
+    ResponseModel,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def field_to_dict(field: FieldModel) -> dict[str, Any]:
@@ -44,9 +46,13 @@ def endpoint_to_dict(ep: EndpointModel) -> dict[str, Any]:
         "method": ep.method,
         "path": ep.path,
         "deprecated": ep.deprecated,
+        "request_body_required": ep.request_body_required,
         "request_params": [field_to_dict(f) for f in ep.request_params],
         "request_body": [field_to_dict(f) for f in ep.request_body],
-        "response_fields": [field_to_dict(f) for f in ep.response_fields],
+        "responses": [
+            {"status": r.status, "fields": [field_to_dict(f) for f in r.fields]}
+            for r in ep.responses
+        ],
     }
 
 
@@ -69,7 +75,15 @@ def baseline_to_dict(b: Baseline) -> dict[str, Any]:
 
 
 def consumer_to_dict(c: ConsumerExpectation) -> dict[str, Any]:
-    return {"service": c.service, "consumer": c.consumer, "operations": list(c.operations)}
+    return {
+        "service": c.service,
+        "consumer": c.consumer,
+        "operations": list(c.operations),
+        "dependencies": [
+            {"operation": d.operation, "response": d.response, "fields": list(d.fields)}
+            for d in c.dependencies
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -118,13 +132,35 @@ def endpoint_from_dict(data: object) -> EndpointModel:
     if not isinstance(data, dict):
         raise StorageCorruptionError("expected_object:endpoint")
     try:
+        responses_raw = data.get("responses")
+        if responses_raw is not None:
+            responses = tuple(
+                ResponseModel(
+                    status=_require(item, "status", "response"),
+                    fields=tuple(
+                        field_from_dict(x) for x in item.get("fields", [])
+                    ),
+                )
+                for item in responses_raw
+            )
+        else:
+            # 向后兼容 schema v1：单个成功响应字段集合，归一化为 "200"
+            responses = (
+                ResponseModel(
+                    status="200",
+                    fields=tuple(
+                        field_from_dict(x) for x in data.get("response_fields", [])
+                    ),
+                ),
+            )
         return EndpointModel(
             method=_require(data, "method", "endpoint"),
             path=_require(data, "path", "endpoint"),
             deprecated=bool(data.get("deprecated", False)),
+            request_body_required=bool(data.get("request_body_required", False)),
             request_params=tuple(field_from_dict(x) for x in data.get("request_params", [])),
             request_body=tuple(field_from_dict(x) for x in data.get("request_body", [])),
-            response_fields=tuple(field_from_dict(x) for x in data.get("response_fields", [])),
+            responses=responses,
         )
     except StorageCorruptionError:
         raise
@@ -170,10 +206,19 @@ def consumer_from_dict(data: object) -> ConsumerExpectation:
     if not isinstance(data, dict):
         raise StorageCorruptionError("expected_object:consumer")
     try:
+        dependencies = tuple(
+            ConsumerDependency(
+                operation=_require(item, "operation", "dependency"),
+                response=_require(item, "response", "dependency"),
+                fields=tuple(item.get("fields", [])),
+            )
+            for item in data.get("dependencies", [])
+        )
         return ConsumerExpectation(
             service=_require(data, "service", "consumer"),
             consumer=_require(data, "consumer", "consumer"),
             operations=tuple(_require(data, "operations", "consumer")),
+            dependencies=dependencies,
         )
     except StorageCorruptionError:
         raise

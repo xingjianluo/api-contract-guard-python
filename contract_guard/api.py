@@ -91,6 +91,7 @@ def _finding_to_dict(f: GateFinding) -> dict[str, Any]:
         "operations": list(f.operations),
         "reason_code": f.reason_code,
         "message": f.message,
+        "consumers": list(f.consumers),
         "change": _change_to_dict(f.change),
     }
 
@@ -169,11 +170,23 @@ def create_app(storage_root: str | None = None) -> FastAPI:
         body = await _read_json_body(request)
         if not isinstance(body, dict) or not isinstance(body.get("operations"), list):
             raise IncompleteContractError("consumer_body_must_have_operations_array")
-        expectation = guard.register_consumer(service, consumer, body["operations"])
+        dependencies = body.get("dependencies", [])
+        if not isinstance(dependencies, list):
+            raise IncompleteContractError("consumer_dependencies_must_be_array")
+        expectation = guard.register_consumer(
+            service,
+            consumer,
+            body["operations"],
+            dependencies=dependencies,
+        )
         return JSONResponse(status_code=201, content={
             "service": service,
             "consumer": expectation.consumer,
             "operations": list(expectation.operations),
+            "dependencies": [
+                {"operation": d.operation, "response": d.response, "fields": list(d.fields)}
+                for d in expectation.dependencies
+            ],
         })
 
     @app.get("/services/{service}/diff/{old_version}/{new_version}")

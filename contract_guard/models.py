@@ -61,6 +61,21 @@ class FieldModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ResponseModel:
+    """同一个操作下声明的一种响应结果（按状态码区分）。
+
+    属性语义：
+        status: 归一化状态码键，如 "200"/"400"/"404"；
+                OpenAPI 的 default 响应归一化为 "default"。
+        fields: 该响应 application/json 体的字段（按名排序）；
+                无内容 / 非 JSON 响应为空元组。
+    """
+
+    status: str
+    fields: tuple[FieldModel, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EndpointModel:
     """单个操作（method + path）的归一化模型。"""
 
@@ -68,7 +83,8 @@ class EndpointModel:
     path: str
     request_params: tuple[FieldModel, ...]
     request_body: tuple[FieldModel, ...]
-    response_fields: tuple[FieldModel, ...]
+    request_body_required: bool
+    responses: tuple[ResponseModel, ...]
     deprecated: bool
 
 
@@ -93,12 +109,36 @@ class Baseline:
 
 
 @dataclass(frozen=True, slots=True)
+class ConsumerDependency:
+    """消费者在单个操作上对某种响应的字段级依赖。
+
+    属性语义：
+        operation: 操作键 ``"METHOD /path"``
+        response:  依赖的响应状态码（如 "200"/"404"/"default"）
+        fields:    真正依赖的响应字段路径元组（点分嵌套，按名排序去重）；
+                   空元组表示“依赖整个响应声明”（不细到字段）。
+    """
+
+    operation: str
+    response: str
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ConsumerExpectation:
-    """消费者对一组操作的使用期望。"""
+    """消费者对一组操作的使用期望。
+
+    老格式（只登记操作）：``dependencies`` 为空，``operations`` 即其使用的操作，
+    门禁行为与历史版本完全一致（操作级命中即受影响）。
+    新格式：``dependencies`` 非空，此时消费者真正“使用”的操作集合是
+    ``operations`` 与各 dependency.operation 的并集；字段级是否受影响由
+    dependencies 精确定位。
+    """
 
     service: str
     consumer: str
     operations: tuple[str, ...]
+    dependencies: tuple[ConsumerDependency, ...] = ()
 
 
 # ---------- 比对 / 门禁结果 ----------
@@ -151,13 +191,20 @@ class GateVerdict(enum.Enum):
 
 @dataclass(frozen=True, slots=True)
 class GateFinding:
-    """门禁对单条破坏性变更的判定明细。"""
+    """门禁对单条破坏性变更的判定明细。
+
+    reason_code 三档可区分：
+        breaking_consumer_affected  命中某消费者声明依赖的具体内容（字段/响应/请求侧）
+        breaking_operation_only     只命中某消费者调用的操作，但未命中其声明的依赖内容
+        breaking_unused             没有任何消费者用到该操作
+    """
 
     affected: bool
     change: Change
     operations: tuple[str, ...]
     reason_code: str
     message: str
+    consumers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
