@@ -17,6 +17,18 @@ class Direction(enum.Enum):
     RESPONSE = "response"
 
 
+def is_success_status(code: str) -> bool:
+    """状态码是否为 2xx。"""
+    return len(code) == 3 and code.isdigit() and code.startswith("2")
+
+
+def response_sort_key(code: str) -> tuple[int, object]:
+    """响应状态码的确定性排序：数字码按数值，``default`` 排在最后。"""
+    if code == "default":
+        return (1, code)
+    return (0, int(code))
+
+
 class ParameterLocation(enum.Enum):
     """请求参数位置。"""
 
@@ -61,6 +73,21 @@ class FieldModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ResponseModel:
+    """同一个操作下声明的某一种响应结果（按状态码区分）。
+
+    属性语义：
+        status_code: 归一化后的状态码键（HTTP 状态码字符串，如 "200"/"404"；
+                     OpenAPI 的 default 响应归一化为 "default"）
+        fields:      该响应 application/json 体的字段，按名排序；
+                     无内容 / 非 JSON 响应为空元组
+    """
+
+    status_code: str
+    fields: tuple[FieldModel, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EndpointModel:
     """单个操作（method + path）的归一化模型。"""
 
@@ -68,8 +95,11 @@ class EndpointModel:
     path: str
     request_params: tuple[FieldModel, ...]
     request_body: tuple[FieldModel, ...]
-    response_fields: tuple[FieldModel, ...]
     deprecated: bool
+    #: 同一操作声明的全部响应结果，按状态码稳定排序
+    responses: tuple[ResponseModel, ...] = ()
+    #: 整个请求体是否必填（OpenAPI requestBody.required）；无请求体时为 False
+    request_body_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,12 +123,35 @@ class Baseline:
 
 
 @dataclass(frozen=True, slots=True)
+class ConsumerDependency:
+    """消费者在单个操作上的细粒度依赖声明。
+
+    属性语义：
+        operation:    操作键，形如 "GET /users/{id}"
+        response:     依赖的响应状态码，如 "200"/"404"
+        fields:       依赖的该响应体内字段路径（点分，嵌套字段递归到子级）；
+                      空元组表示只依赖“会收到这种响应”这一事实（不依赖体内字段）
+    """
+
+    operation: str
+    response: str
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ConsumerExpectation:
-    """消费者对一组操作的使用期望。"""
+    """消费者对一组操作的使用期望。
+
+    两种粒度可并存：
+        operations:  操作级登记（老方式）：调用这些操作，其全部破坏都算命中；
+        dependencies: 字段/响应级登记：只依赖某操作的某一种响应里的部分字段。
+    """
 
     service: str
     consumer: str
     operations: tuple[str, ...]
+    #: 细粒度依赖；空元组表示纯操作级的老消费者
+    dependencies: tuple[ConsumerDependency, ...] = ()
 
 
 # ---------- 比对 / 门禁结果 ----------
@@ -158,6 +211,8 @@ class GateFinding:
     operations: tuple[str, ...]
     reason_code: str
     message: str
+    #: 真正被该破坏命中的消费者（命中其依赖内容或操作级登记），按名排序
+    affected_consumers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

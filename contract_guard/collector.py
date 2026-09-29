@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -35,10 +36,14 @@ from .models import (
     EndpointModel,
     FieldModel,
     ParameterLocation,
+    ResponseModel,
+    is_success_status,
+    response_sort_key,
 )
 
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
 _JSON_MEDIA = "application/json"
+_STATUS_CODE_RE = re.compile(r"^[1-5]\d{2}$")
 
 
 def _incomplete(reason: str) -> IncompleteContractError:
@@ -132,16 +137,18 @@ class ContractCollector:
         self, op: Mapping[str, object], op_key: str
     ) -> EndpointModel:
         params = self._collect_parameters(op.get("parameters"), op_key)
-        body = self._collect_body(op.get("requestBody"), op_key)
-        responses = self._collect_response(op.get("responses"), op_key)
+        body, body_required = self._collect_body(op.get("requestBody"), op_key)
+        responses = self._collect_responses(op.get("responses"), op_key)
         deprecated = bool(op.get("deprecated", False))
+        method, path = op_key.split(" ", 1)
         return EndpointModel(
-            method=op_key.split(" ", 1)[0],
-            path=op_key.split(" ", 1)[1],
+            method=method,
+            path=path,
             request_params=params,
             request_body=body,
-            response_fields=responses,
             deprecated=deprecated,
+            responses=responses,
+            request_body_required=body_required,
         )
 
     # ------------------------------------------------------------------ #
@@ -203,11 +210,14 @@ class ContractCollector:
     # 请求体
     # ------------------------------------------------------------------ #
 
-    def _collect_body(self, raw: object, op_key: str) -> tuple[FieldModel, ...]:
+    def _collect_body(
+        self, raw: object, op_key: str
+    ) -> tuple[tuple[FieldModel, ...], bool]:
         if raw is None:
-            return ()
+            return (), False
         if not isinstance(raw, Mapping):
             raise ContractParseError(f"request_body_must_be_object:{op_key}")
+        required = bool(raw.get("required", False))
         content = raw.get("content")
         if not isinstance(content, Mapping):
             raise _incomplete(f"request_body_missing_content:{op_key}")
@@ -219,39 +229,67 @@ class ContractCollector:
         schema = media.get("schema")
         if not isinstance(schema, Mapping):
             raise _incomplete(f"request_body_missing_schema:{op_key}")
-        return self._schema_fields(schema, Direction.REQUEST, None, op_key, "requestBody")
+        fields = self._schema_fields(
+            schema, Direction.REQUEST, None, op_key, "requestBody"
+        )
+        return fields, required
 
     # ------------------------------------------------------------------ #
-    # 响应（确定性选择：取数字最小的 2xx 状态码）
+    # 响应（采集操作声明的每一种响应结果，按状态码稳定排序）
     # ------------------------------------------------------------------ #
 
-    def _collect_response(self, raw: object, op_key: str) -> tuple[FieldModel, ...]:
+    def _collect_responses(
+        self, raw: object, op_key: str
+    ) -> tuple[ResponseModel, ...]:
         if not isinstance(raw, Mapping):
             raise _incomplete(f"missing_responses:{op_key}")
 
-        success_codes = sorted(
-            code for code in raw if isinstance(code, str)
-            and len(code) == 3 and code.startswith("2") and code[1:].isdigit()
-        )
-        if not success_codes:
+        status_keys: list[str] = []
+        for code in raw:
+            if isinstance(code, str) and _STATUS_CODE_RE.match(code):
+                status_keys.append(code)
+            elif code == "default":
+                status_keys.append("default")
+            else:
+                raise _incomplete(f"invalid_response_status:{op_key}:{code!r}")
+
+        if not any(is_success_status(code) for code in status_keys):
             raise _incomplete(f"missing_success_response:{op_key}")
-        resp = raw[success_codes[0]]
-        if not isinstance(resp, Mapping):
-            raise ContractParseError(f"response_must_be_object:{op_key}:{success_codes[0]}")
+
+        responses: list[ResponseModel] = []
+        for code in status_keys:
+            resp = raw[code]
+            if not isinstance(resp, Mapping):
+                raise ContractParseError(
+                    f"response_must_be_object:{op_key}:{code}"
+                )
+            fields = self._collect_one_response(resp, op_key, code)
+            responses.append(ResponseModel(status_code=code, fields=fields))
+
+        responses.sort(key=lambda r: response_sort_key(r.status_code))
+        return tuple(responses)
+
+    def _collect_one_response(
+        self, resp: Mapping[str, object], op_key: str, code: str
+    ) -> tuple[FieldModel, ...]:
         content = resp.get("content")
         if content is None:
-            return ()  # 204 风格：允许无响应体
+            return ()  # 204 风格 / 无 body：允许无响应字段
         if not isinstance(content, Mapping):
-            raise ContractParseError(f"response_content_must_be_object:{op_key}")
+            raise ContractParseError(f"response_content_must_be_object:{op_key}:{code}")
         media = content.get(_JSON_MEDIA)
         if media is None:
             return ()  # 非 JSON 响应体不纳入契约模型
         if not isinstance(media, Mapping):
-            raise ContractParseError(f"media_type_object_must_be_object:{op_key}")
+            raise ContractParseError(
+                f"media_type_object_must_be_object:{op_key}:{code}"
+            )
         schema = media.get("schema")
         if not isinstance(schema, Mapping):
-            raise _incomplete(f"response_missing_schema:{op_key}")
-        return self._schema_fields(schema, Direction.RESPONSE, None, op_key, "response")
+            raise _incomplete(f"response_missing_schema:{op_key}:{code}")
+        return self._schema_fields(
+            schema, Direction.RESPONSE, None, op_key, f"response-{code}"
+        )
 
     # ------------------------------------------------------------------ #
     # schema -> FieldModel
@@ -438,9 +476,16 @@ class ContractCollector:
             "method": endpoint.method,
             "path": endpoint.path,
             "deprecated": endpoint.deprecated,
+            "request_body_required": endpoint.request_body_required,
             "request_params": [self._field_to_primitive(f) for f in endpoint.request_params],
             "request_body": [self._field_to_primitive(f) for f in endpoint.request_body],
-            "response_fields": [self._field_to_primitive(f) for f in endpoint.response_fields],
+            "responses": [
+                {
+                    "status_code": r.status_code,
+                    "fields": [self._field_to_primitive(f) for f in r.fields],
+                }
+                for r in endpoint.responses
+            ],
         }
 
     def _field_to_primitive(self, field: FieldModel) -> dict[str, Any]:

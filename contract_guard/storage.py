@@ -39,8 +39,9 @@ from .errors import (
     StorageCorruptionError,
     StorageError,
 )
-from .models import Baseline, ConsumerExpectation
+from .models import Baseline, ConsumerDependency, ConsumerExpectation
 from .serializers import (
+    READABLE_SCHEMA_VERSIONS,
     SCHEMA_VERSION,
     baseline_from_dict,
     baseline_to_dict,
@@ -154,7 +155,7 @@ class LocalStore:
         data = self._read_json(service_dir / filename)
         if data is None:
             return {"schema_version": SCHEMA_VERSION, key: {}}
-        if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+        if not isinstance(data, dict) or data.get("schema_version") not in READABLE_SCHEMA_VERSIONS:
             raise StorageCorruptionError(f"unexpected_index_format:{filename}")
         records = data.get(key)
         if not isinstance(records, dict):
@@ -229,23 +230,50 @@ class LocalStore:
             path = service_dir / "consumers.json"
             data = self._load_index(path.parent, "consumers.json", "consumers")
             records: dict[str, Any] = data["consumers"]
-            normalized = ConsumerExpectation(
-                service=service,
-                consumer=expectation.consumer,
-                operations=tuple(sorted(set(expectation.operations))),
-            )
+            normalized = self._normalize_consumer(expectation, service)
             existing_raw = records.get(normalized.consumer)
             if existing_raw is not None:
                 existing = consumer_from_dict(existing_raw)
-                if existing.operations != normalized.operations:
+                if existing.operations != normalized.operations or \
+                        existing.dependencies != normalized.dependencies:
                     raise ConsumerConflictError(
                         f"consumer_exists_with_different_expectations:"
-                        f"{normalized.consumer}:existing={list(existing.operations)}:"
-                        f"incoming={list(normalized.operations)}"
+                        f"{normalized.consumer}:existing="
+                        f"ops={list(existing.operations)},"
+                        f"deps={[(d.operation, d.response, list(d.fields)) for d in existing.dependencies]}:"
+                        f"incoming="
+                        f"ops={list(normalized.operations)},"
+                        f"deps={[(d.operation, d.response, list(d.fields)) for d in normalized.dependencies]}"
                     )
                 return
             records[normalized.consumer] = consumer_to_dict(normalized)
             self._atomic_write_json(path, data)
+
+    @staticmethod
+    def _normalize_consumer(
+        expectation: ConsumerExpectation, service: str
+    ) -> ConsumerExpectation:
+        """操作集合排序去重；依赖按 (操作,响应) 合并、字段取并集、整体稳定排序。
+
+        同一 (操作, 响应) 的多条声明字段取并集，声明顺序/消费者数量不影响结论。
+        """
+        merged: dict[tuple[str, str], set[str]] = {}
+        for dep in expectation.dependencies:
+            merged.setdefault((dep.operation, dep.response), set()).update(dep.fields)
+        dependencies = tuple(
+            ConsumerDependency(
+                operation=op,
+                response=resp,
+                fields=tuple(sorted(fields)),
+            )
+            for (op, resp), fields in sorted(merged.items())
+        )
+        return ConsumerExpectation(
+            service=service,
+            consumer=expectation.consumer,
+            operations=tuple(sorted(set(expectation.operations))),
+            dependencies=dependencies,
+        )
 
     def get_consumer(self, service: str, consumer: str) -> ConsumerExpectation:
         service_dir = self._service_dir(service)

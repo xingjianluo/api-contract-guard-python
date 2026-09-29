@@ -18,6 +18,7 @@ from .errors import (
     BaselineConflictError,
     BaselineNotFoundError,
     ConsumerConflictError,
+    ConsumerDependencyError,
     ContractGuardError,
     ContractParseError,
     IncompleteContractError,
@@ -38,6 +39,7 @@ STORAGE_ENV = "CONTRACT_GUARD_STORAGE"
 
 _HTTP_STATUS = {
     ContractParseError: 400,
+    ConsumerDependencyError: 422,
     IncompleteContractError: 422,
     UnsupportedContractError: 422,
     BaselineConflictError: 409,
@@ -91,6 +93,7 @@ def _finding_to_dict(f: GateFinding) -> dict[str, Any]:
         "operations": list(f.operations),
         "reason_code": f.reason_code,
         "message": f.message,
+        "affected_consumers": list(f.affected_consumers),
         "change": _change_to_dict(f.change),
     }
 
@@ -167,13 +170,33 @@ def create_app(storage_root: str | None = None) -> FastAPI:
     @app.post("/services/{service}/consumers/{consumer}")
     async def register_consumer(service: str, consumer: str, request: Request) -> JSONResponse:
         body = await _read_json_body(request)
-        if not isinstance(body, dict) or not isinstance(body.get("operations"), list):
-            raise IncompleteContractError("consumer_body_must_have_operations_array")
-        expectation = guard.register_consumer(service, consumer, body["operations"])
+        if not isinstance(body, dict):
+            raise IncompleteContractError("consumer_body_must_be_object")
+        operations = body.get("operations", [])
+        dependencies = body.get("dependencies", [])
+        if not isinstance(operations, list):
+            raise IncompleteContractError("consumer_operations_must_be_array")
+        if not isinstance(dependencies, list):
+            raise IncompleteContractError("consumer_dependencies_must_be_array")
+        if not operations and not dependencies:
+            raise IncompleteContractError(
+                "consumer_must_declare_operations_or_dependencies"
+            )
+        expectation = guard.register_consumer(
+            service, consumer, operations, dependencies
+        )
         return JSONResponse(status_code=201, content={
             "service": service,
             "consumer": expectation.consumer,
             "operations": list(expectation.operations),
+            "dependencies": [
+                {
+                    "operation": d.operation,
+                    "response": d.response,
+                    "fields": list(d.fields),
+                }
+                for d in expectation.dependencies
+            ],
         })
 
     @app.get("/services/{service}/diff/{old_version}/{new_version}")

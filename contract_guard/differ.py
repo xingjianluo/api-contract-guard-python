@@ -3,7 +3,7 @@
 兼容性分级（方向相关）：
 
 请求侧（客户端 -> 服务端）
-    请求可选字段变必填          BREAKING  request_required_added/request_optional_to_required
+    请求可选字段变必填          BREAKING  request_optional_to_required
     请求新增必填字段            BREAKING  request_required_added
     请求新增可选字段            COMPATIBLE request_optional_added（老客户端不传也成立）
     请求删除字段                COMPATIBLE request_field_removed（老客户端继续发，通常被忽略）
@@ -16,7 +16,15 @@
     移除默认值                  BREAKING  default_removed
     新增默认值/默认值改变        COMPATIBLE default_added/default_changed（对既有请求无强制）
 
-响应侧（服务端 -> 客户端）
+请求体整体必填性（与“单个字段必填”明确区分，原因码不同）
+    无请求体/可选 -> 必须带      BREAKING  request_body_required_added
+    必须带 -> 可选/可以不带      COMPATIBLE request_body_required_relaxed
+
+响应侧（服务端 -> 客户端），按操作声明的*每一种*响应结果（状态码）分别比对
+    新增一种响应结果            ADDED     response_added（老消费者不依赖它，无破坏）
+    删除一种已声明的响应结果     BREAKING  response_removed（依赖该结果的消费者会失败）
+    某响应体从无到有            COMPATIBLE response_body_added
+    某响应体整体移除            BREAKING  response_body_removed
     新增字段                    COMPATIBLE response_field_added（老客户端忽略未知字段）
     删除字段                    BREAKING  response_field_removed
     类型改变                    BREAKING  type_changed
@@ -29,11 +37,9 @@
 端点级
     新增端点                    ADDED     endpoint_added
     删除端点                    BREAKING  endpoint_removed
-    新增/移除整个请求体         按 BREAKING/COMPATIBLE 区分（见实现）
-    整个响应体移除              BREAKING  response_body_removed
 
-所有变更按固定规则排序后输出，同一对版本重复比对（含从不同入口触发）
-结论完全一致。
+所有变更按固定规则排序后输出，同一对版本重复比对（含从不同入口触发、
+响应声明顺序重排）结论完全一致。
 """
 
 from __future__ import annotations
@@ -45,7 +51,9 @@ from .models import (
     Direction,
     EndpointModel,
     FieldModel,
+    ResponseModel,
     Severity,
+    response_sort_key,
 )
 
 _SEVERITY_ORDER = {Severity.BREAKING: 0, Severity.COMPATIBLE: 1, Severity.ADDED: 2}
@@ -125,17 +133,52 @@ class SnapshotDiffer:
             self._diff_fields(old.request_params, new.request_params, f"{prefix}#request-param")
         )
         changes.extend(
-            self._diff_fields(old.request_body, new.request_body, f"{prefix}#request-body")
+            self._diff_request_body(old, new, prefix)
         )
         changes.extend(
-            self._diff_fields(old.response_fields, new.response_fields, f"{prefix}#response")
+            self._diff_responses(old.responses, new.responses, prefix)
         )
+        return changes
 
-        # 整个请求体的新增/移除（端点存在但一侧有 body、一侧没有）
-        if not old.request_body and new.request_body:
-            # 新增 body 字段集合的必填性已在字段级逐条标注；此处只在“整体新增”时
-            # 不额外造变更，避免重复计数。
-            pass
+    # ------------------------------------------------------------------ #
+    # 请求体（整体必填性与字段级变化分开）
+    # ------------------------------------------------------------------ #
+
+    def _diff_request_body(
+        self, old: EndpointModel, new: EndpointModel, prefix: str
+    ) -> list[Change]:
+        changes: list[Change] = []
+
+        # 整个请求体必填性：原因码独立于“单个字段必填”（request_optional_to_required）
+        if not old.request_body_required and new.request_body_required:
+            changes.append(
+                Change(
+                    severity=Severity.BREAKING,
+                    path=prefix,
+                    kind="request_body_required_added",
+                    reason_code="request_body_required_added",
+                    message=(
+                        "请求体由可以不带变为必须携带：不带请求体的旧客户端会被拒绝"
+                        if old.request_body
+                        else "新增了必须携带的请求体：不带请求体的旧客户端会被拒绝"
+                    ),
+                    old=old.request_body_required,
+                    new=True,
+                )
+            )
+        elif old.request_body_required and not new.request_body_required and new.request_body:
+            changes.append(
+                Change(
+                    severity=Severity.COMPATIBLE,
+                    path=prefix,
+                    kind="request_body_required_relaxed",
+                    reason_code="request_body_required_relaxed",
+                    message="请求体由必须携带放宽为可以不带，旧客户端继续携带不受影响",
+                    old=True,
+                    new=False,
+                )
+            )
+
         if old.request_body and not new.request_body:
             changes.append(
                 Change(
@@ -146,16 +189,118 @@ class SnapshotDiffer:
                     message="服务端不再要求请求体，对旧客户端兼容",
                 )
             )
-        if old.response_fields and not new.response_fields:
+            return changes
+
+        if not old.request_body and new.request_body:
+            if new.request_body_required:
+                # 新增必填请求体的破坏已由整体级 request_body_required_added 表达，
+                # 不再重复逐字段计数。
+                return changes
+            # 新增可选请求体：字段级新增按既有规则给出（均为兼容）
+            changes.extend(
+                self._diff_fields((), new.request_body, f"{prefix}#request-body")
+            )
+            return changes
+
+        # 两侧都有请求体：字段级照常比对
+        changes.extend(
+            self._diff_fields(old.request_body, new.request_body, f"{prefix}#request-body")
+        )
+        return changes
+
+    # ------------------------------------------------------------------ #
+    # 多种响应结果
+    # ------------------------------------------------------------------ #
+
+    def _diff_responses(
+        self,
+        old_responses: tuple[ResponseModel, ...],
+        new_responses: tuple[ResponseModel, ...],
+        prefix: str,
+    ) -> list[Change]:
+        old_map = {r.status_code: r for r in old_responses}
+        new_map = {r.status_code: r for r in new_responses}
+        changes: list[Change] = []
+
+        for code in sorted(old_map.keys() | new_map.keys(), key=response_sort_key):
+            old_r = old_map.get(code)
+            new_r = new_map.get(code)
+            section = f"{prefix}#response-{code}"
+            if old_r is None and new_r is not None:
+                changes.append(
+                    Change(
+                        severity=Severity.ADDED,
+                        path=section,
+                        kind="response_added",
+                        reason_code="response_added",
+                        message=f"新增响应结果 {code}，既有消费者不依赖该结果，无破坏",
+                        old=None,
+                        new=code,
+                    )
+                )
+                # 新响应内部字段也逐条登记为新增（纯新增，不破坏）
+                changes.extend(self._nested_additions_root(new_r, section))
+            elif new_r is None and old_r is not None:
+                changes.append(
+                    Change(
+                        severity=Severity.BREAKING,
+                        path=section,
+                        kind="response_removed",
+                        reason_code="response_removed",
+                        message=(
+                            f"已声明的响应结果 {code} 被删除：依赖该结果的消费者将无法"
+                            "再按契约处理它"
+                        ),
+                        old=code,
+                        new=None,
+                    )
+                )
+            else:
+                assert old_r is not None and new_r is not None
+                changes.extend(self._diff_one_response(old_r, new_r, section))
+        return changes
+
+    def _nested_additions_root(
+        self, response: ResponseModel, section: str
+    ) -> list[Change]:
+        out: list[Change] = []
+        for field_ in response.fields:
+            path = f"{section}.{field_.name}"
+            out.append(self._classify_added_field(field_, path))
+            out.extend(self._nested_additions(field_, path))
+        return out
+
+    def _diff_one_response(
+        self, old: ResponseModel, new: ResponseModel, section: str
+    ) -> list[Change]:
+        changes: list[Change] = []
+        if old.fields and not new.fields:
             changes.append(
                 Change(
                     severity=Severity.BREAKING,
-                    path=prefix,
+                    path=section,
                     kind="response_body_removed",
                     reason_code="response_body_removed",
-                    message="成功响应体被移除，依赖响应字段的消费者会失败",
+                    message=(
+                        f"响应 {new.status_code} 的响应体被移除，依赖其字段的消费者会失败"
+                    ),
                 )
             )
+            return changes
+        if not old.fields and new.fields:
+            changes.append(
+                Change(
+                    severity=Severity.COMPATIBLE,
+                    path=section,
+                    kind="response_body_added",
+                    reason_code="response_body_added",
+                    message=f"响应 {new.status_code} 新增响应体，旧客户端忽略未知内容即可",
+                )
+            )
+            changes.extend(self._nested_additions_root(new, section))
+            return changes
+        # 两侧都有 body（或都没有）：字段级比对
+        changes.extend(self._diff_fields(old.fields, new.fields, section))
         return changes
 
     # ------------------------------------------------------------------ #

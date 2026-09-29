@@ -75,7 +75,7 @@ def test_response_field_added_is_compatible_and_removed_is_breaking() -> None:
     new = _snapshot(minimal_contract(response_fields={"id": {"type": "integer"}}), "1.0.1")
     r = differ.diff(old, new)
     codes = _codes(r)
-    path = [p for p in codes if p.endswith("response.name")][0]
+    path = [p for p in codes if p.endswith("response-200.name")][0]
     logger.info("响应删除 name -> %s: %s", path, codes[path])
     assert codes[path] == "breaking"
 
@@ -83,7 +83,7 @@ def test_response_field_added_is_compatible_and_removed_is_breaking() -> None:
     r_rev = differ.diff(_snapshot(minimal_contract(response_fields={"id": {"type": "integer"}}), "1.0.0"),
                         _snapshot(minimal_contract(response_fields={
                             "id": {"type": "integer"}, "name": {"type": "string"}}), "1.0.1"))
-    rev_path = [p for p in _codes(r_rev) if p.endswith("response.name")][0]
+    rev_path = [p for p in _codes(r_rev) if p.endswith("response-200.name")][0]
     assert _codes(r_rev)[rev_path] == "compatible"
 
 

@@ -11,15 +11,20 @@ from typing import Any
 from .errors import StorageCorruptionError
 from .models import (
     Baseline,
+    ConsumerDependency,
     ConsumerExpectation,
     ContractSnapshot,
     Direction,
     EndpointModel,
     FieldModel,
     ParameterLocation,
+    ResponseModel,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# 读取端兼容的历史版本：v1 只有成功响应（response_fields）、无请求体必填性、
+# 消费者只有操作级登记。
+READABLE_SCHEMA_VERSIONS = frozenset({1, 2})
 
 
 def field_to_dict(field: FieldModel) -> dict[str, Any]:
@@ -39,14 +44,22 @@ def field_to_dict(field: FieldModel) -> dict[str, Any]:
     }
 
 
+def response_to_dict(resp: ResponseModel) -> dict[str, Any]:
+    return {
+        "status_code": resp.status_code,
+        "fields": [field_to_dict(f) for f in resp.fields],
+    }
+
+
 def endpoint_to_dict(ep: EndpointModel) -> dict[str, Any]:
     return {
         "method": ep.method,
         "path": ep.path,
         "deprecated": ep.deprecated,
+        "request_body_required": ep.request_body_required,
         "request_params": [field_to_dict(f) for f in ep.request_params],
         "request_body": [field_to_dict(f) for f in ep.request_body],
-        "response_fields": [field_to_dict(f) for f in ep.response_fields],
+        "responses": [response_to_dict(r) for r in ep.responses],
     }
 
 
@@ -68,8 +81,21 @@ def baseline_to_dict(b: Baseline) -> dict[str, Any]:
     }
 
 
+def dependency_to_dict(dep: ConsumerDependency) -> dict[str, Any]:
+    return {
+        "operation": dep.operation,
+        "response": dep.response,
+        "fields": list(dep.fields),
+    }
+
+
 def consumer_to_dict(c: ConsumerExpectation) -> dict[str, Any]:
-    return {"service": c.service, "consumer": c.consumer, "operations": list(c.operations)}
+    return {
+        "service": c.service,
+        "consumer": c.consumer,
+        "operations": list(c.operations),
+        "dependencies": [dependency_to_dict(d) for d in c.dependencies],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -114,17 +140,41 @@ def field_from_dict(data: object, *, direction_default: Direction | None = None)
         raise StorageCorruptionError("invalid_field_record", cause=exc) from exc
 
 
+def response_from_dict(data: object) -> ResponseModel:
+    if not isinstance(data, dict):
+        raise StorageCorruptionError("expected_object:response")
+    try:
+        return ResponseModel(
+            status_code=_require(data, "status_code", "response"),
+            fields=tuple(field_from_dict(x) for x in data.get("fields", [])),
+        )
+    except StorageCorruptionError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise StorageCorruptionError("invalid_response_record", cause=exc) from exc
+
+
 def endpoint_from_dict(data: object) -> EndpointModel:
     if not isinstance(data, dict):
         raise StorageCorruptionError("expected_object:endpoint")
     try:
+        if "responses" in data:
+            responses = tuple(response_from_dict(x) for x in data["responses"])
+        else:
+            # v1 旧记录：只有成功响应字段，归一成单一 "200" 响应
+            legacy_fields = tuple(
+                field_from_dict(x) for x in data.get("response_fields", [])
+            )
+            responses = (ResponseModel(status_code="200", fields=legacy_fields),) \
+                if legacy_fields else ()
         return EndpointModel(
             method=_require(data, "method", "endpoint"),
             path=_require(data, "path", "endpoint"),
             deprecated=bool(data.get("deprecated", False)),
             request_params=tuple(field_from_dict(x) for x in data.get("request_params", [])),
             request_body=tuple(field_from_dict(x) for x in data.get("request_body", [])),
-            response_fields=tuple(field_from_dict(x) for x in data.get("response_fields", [])),
+            responses=responses,
+            request_body_required=bool(data.get("request_body_required", False)),
         )
     except StorageCorruptionError:
         raise
@@ -166,6 +216,21 @@ def baseline_from_dict(data: object) -> Baseline:
         raise StorageCorruptionError("invalid_baseline_record", cause=exc) from exc
 
 
+def dependency_from_dict(data: object) -> ConsumerDependency:
+    if not isinstance(data, dict):
+        raise StorageCorruptionError("expected_object:dependency")
+    try:
+        return ConsumerDependency(
+            operation=_require(data, "operation", "dependency"),
+            response=_require(data, "response", "dependency"),
+            fields=tuple(data.get("fields", [])),
+        )
+    except StorageCorruptionError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise StorageCorruptionError("invalid_dependency_record", cause=exc) from exc
+
+
 def consumer_from_dict(data: object) -> ConsumerExpectation:
     if not isinstance(data, dict):
         raise StorageCorruptionError("expected_object:consumer")
@@ -174,6 +239,9 @@ def consumer_from_dict(data: object) -> ConsumerExpectation:
             service=_require(data, "service", "consumer"),
             consumer=_require(data, "consumer", "consumer"),
             operations=tuple(_require(data, "operations", "consumer")),
+            dependencies=tuple(
+                dependency_from_dict(x) for x in data.get("dependencies", [])
+            ),
         )
     except StorageCorruptionError:
         raise
@@ -183,8 +251,13 @@ def consumer_from_dict(data: object) -> ConsumerExpectation:
 
 __all__ = [
     "SCHEMA_VERSION",
+    "READABLE_SCHEMA_VERSIONS",
     "baseline_to_dict",
     "baseline_from_dict",
     "consumer_to_dict",
     "consumer_from_dict",
+    "dependency_to_dict",
+    "dependency_from_dict",
+    "response_to_dict",
+    "response_from_dict",
 ]

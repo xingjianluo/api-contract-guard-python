@@ -63,6 +63,30 @@ class ConsumerConflictError(ContractGuardError):
     code = "consumer_conflict"
 
 
+class ConsumerDependencyError(IncompleteContractError):
+    """消费者细粒度依赖声明不合法的基类（HTTP 统一 422）。"""
+
+    code = "consumer_dependency_invalid"
+
+
+class ConsumerUnknownOperationError(ConsumerDependencyError):
+    """依赖指向当前契约中根本不存在的操作。"""
+
+    code = "consumer_dependency_unknown_operation"
+
+
+class ConsumerUnknownResponseError(ConsumerDependencyError):
+    """依赖指向某操作下根本没有声明的响应结果。"""
+
+    code = "consumer_dependency_unknown_response"
+
+
+class ConsumerUnknownFieldError(ConsumerDependencyError):
+    """依赖指向某响应中根本不存在的字段路径。"""
+
+    code = "consumer_dependency_unknown_field"
+
+
 class ConsumerNotFoundError(ContractGuardError):
     """指定消费者不存在。"""
 
