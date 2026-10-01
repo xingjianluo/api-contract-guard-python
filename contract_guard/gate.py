@@ -11,8 +11,10 @@
 * 操作级（老方式）：登记 ``operations``，视为依赖该操作的全部内容，
   该操作上任何破坏都命中它（行为与历史完全一致）；
 * 依赖级：登记 ``dependencies``（操作 + 响应状态码 + 字段路径集合），
-  只有真正命中其所声明响应/字段的响应侧破坏才算命中；请求侧破坏
-  （调用方发不出合法请求）也会影响所有调用该操作的消费者。
+  只有真正命中其所声明响应/字段的响应侧破坏才算命中；声明字段所在的
+  上层对象被整体删除/改掉（变更路径是声明字段的上层前缀）同样算命中；
+  请求侧破坏（调用方发不出合法请求，含请求体整体必填收紧
+  ``request_body_required_added``）也会影响所有调用该操作的消费者。
 
 每条破坏对应一个 finding，原因码三选一、互相可区分：
 
@@ -134,11 +136,22 @@ class ReleaseGate:
                     f"破坏性变更影响 {len(hit_consumers)} 个已登记消费者"
                     f"({', '.join(hit_consumers)})；操作 {op} 仍在被使用"
                 )
-            else:
+            elif dependency_hit:
                 reason = REASON_DEPENDENCY_HIT
                 message = (
                     f"破坏性变更命中 {len(hit_consumers)} 个消费者声明依赖的内容"
                     f"({', '.join(hit_consumers)})：{change.path}"
+                )
+            else:
+                # 纯请求侧命中：调用该操作的消费者发不出合法请求。
+                # 消息带上变更自身原因码，整体必填收紧
+                # （request_body_required_added）与字段级必填
+                # （request_optional_to_required 等）可明确区分。
+                reason = REASON_DEPENDENCY_HIT
+                message = (
+                    f"请求侧破坏性变更使 {len(hit_consumers)} 个调用该操作的消费者"
+                    f"({', '.join(hit_consumers)})无法继续发出合法请求："
+                    f"{change.path}（{change.reason_code}）"
                 )
             return GateFinding(
                 affected=True,
@@ -173,11 +186,14 @@ class ReleaseGate:
         section: str | None, change: Change
     ) -> bool:
         """请求侧（或端点级）破坏：调用方发不出合法请求，影响所有调用者。"""
+        # 请求体整体必填收紧的路径不带 #section（挂在操作键上），按 kind 识别，
+        # 与“某个字段变必填”（request-body 段内的字段级破坏）同样影响所有调用者
+        if change.kind == "request_body_required_added":
+            return True
         if section is None:
             # 端点级破坏只有 endpoint_removed（BREAKING）
             return change.kind == "endpoint_removed"
-        return section in {"request-param", "request-body"} or \
-            change.kind == "request_body_required_added"
+        return section in {"request-param", "request-body"}
 
     @staticmethod
     def _split_change_path(path: str) -> tuple[str | None, str]:
@@ -223,8 +239,15 @@ class ReleaseGate:
         if not detail:
             return False
 
-        # detail 为点分字段路径；声明字段是破坏路径本身或其上层前缀即命中
-        return any(detail == f or detail.startswith(f + ".") for f in dep.fields)
+        # detail 为点分字段路径。命中规则（两个方向的前缀都算）：
+        # 1. 声明字段是破坏路径本身或其上层（破坏发生在声明字段或其子级）；
+        # 2. 破坏路径是声明字段的上层（声明的嵌套字段所在对象被整体删除/改掉）。
+        return any(
+            detail == f
+            or detail.startswith(f + ".")
+            or f.startswith(detail + ".")
+            for f in dep.fields
+        )
 
 
 __all__ = ["ReleaseGate", "operation_key_of"]
