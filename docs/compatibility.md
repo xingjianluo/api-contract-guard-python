@@ -103,10 +103,25 @@
    “会收到这种响应”这一事实。登记时按**该服务最新基线**校验，
    操作/响应/字段不存在即以可区分错误码拒绝（见下）。
 
-请求侧破坏（如新增必填参数、整个请求体变必填、端点删除）意味着调用方发不出
-合法请求，因此**只要消费者调用该操作（无论哪种粒度）都算命中**；响应侧破坏
-才按声明的响应与字段精确匹配：声明字段是变更字段本身或其上层前缀即命中，
-删除整个响应 / 移除响应体则命中所有依赖该响应的消费者。
+请求侧破坏（如新增必填参数、**整个请求体由可以不带变为必须带**
+`request_body_required_added`、端点删除）意味着调用方发不出合法请求，
+因此**只要消费者调用该操作（无论哪种粒度）都算命中**——即使它只登记了
+响应侧依赖。注意这与“体内某个字段从可选变必填”
+（`request_optional_to_required`）是两条独立原因码：前者挂在操作键上
+（路径形如 `POST /users`），后者挂在具体字段上
+（路径形如 `POST /users#request-body.name`），判定依据不会混淆。
+
+响应侧破坏按声明的响应与字段精确匹配，字段命中看三个位置关系
+（任一成立即命中）：
+
+1. 声明字段就是变更字段本身（`profile.avatar` 改了 `profile.avatar`）；
+2. 声明字段是变更字段的上层（依赖 `profile`，`profile.avatar` 被删）；
+3. **声明字段位于变更字段的下层**（依赖 `profile.avatar`，而 `profile`
+   整个对象被删除或整体改型）——依赖的内容随上层一起消失，同样算命中。
+
+删除整个响应 / 移除响应体则命中所有依赖该响应的消费者；反过来，
+消费者**未声明依赖**的响应或字段发生变化（如依赖 `profile.avatar` 而
+`sibling` 字段或另一种状态码的响应被动）不会误算命中，仍只是 warn。
 
 ### 三档结论与每条破坏的原因码
 
@@ -194,6 +209,9 @@ uv sync --group dev
 # 2) 运行全部单测（实时日志会打印输入契约、判定依据、最终结论）
 .venv/bin/python -m pytest -q
 
+# 2a) 只跑本次两类门禁命中场景的回归用例
+.venv/bin/python -m pytest tests/test_gate_breaking_hits.py -q
+
 # 3) 启动真实服务
 CONTRACT_GUARD_STORAGE=./.guard_data .venv/bin/python -m uvicorn main:app --port 8000
 
@@ -208,6 +226,34 @@ curl localhost:8000/services/shop/release-check/1.0.0/2.0.0
 测试覆盖矩阵：并发登记（线程 + 跨进程冲突）、重复判定一致性与多入口一致、
 请求/响应两侧各类破坏性与兼容变更、枚举/可空/默认值语义、
 **多响应结果的新增/删除/改字段（原因可区分）、请求体整体必填与字段必填区分、
-消费者字段/响应级依赖的三档门禁、非法依赖的三种 422 拒绝码、
-老操作级消费者兼容、同名消费者冲突、v1 落盘数据向后兼容**、
-畸形契约的可区分拒绝原因、损坏存储归一化、HTTP 与库调用入口结论一致性。
+请求体整体必填收紧命中依赖级消费者（reject）、依赖嵌套字段时上层对象
+整体删除/改型算命中且不误伤未声明内容、消费者字段/响应级依赖的三档门禁、
+非法依赖的三种 422 拒绝码、老操作级消费者兼容、同名消费者冲突、
+v1 落盘数据向后兼容**、畸形契约的可区分拒绝原因、损坏存储归一化、
+HTTP 与库调用入口结论一致性。
+
+### 手工验证本次两类命中场景
+
+```bash
+# 场景 A：请求体可选 -> 必填，依赖级消费者应被 reject
+#   v1: POST /users 的 requestBody.required=false；v2 改为 true
+#   消费者：{"dependencies":[{"operation":"POST /users","response":"201"}]}
+curl -X POST localhost:8000/services/shop/baselines/1.0.0 \
+     -H 'Content-Type: application/json' --data @body_optional.json
+curl -X POST localhost:8000/services/shop/consumers/web \
+     -H 'Content-Type: application/json' \
+     -d '{"dependencies":[{"operation":"POST /users","response":"201"}]}'
+curl -X POST localhost:8000/services/shop/baselines/2.0.0 \
+     -H 'Content-Type: application/json' --data @body_required.json
+curl localhost:8000/services/shop/release-check/1.0.0/2.0.0
+#   期望：verdict=reject，finding.change.reason_code=request_body_required_added
+#   （若只是体内某字段变必填，则该值为 request_optional_to_required，可区分）
+
+# 场景 B：依赖 200.profile.avatar，v2 整体删除 profile 对象，应被 reject
+curl -X POST localhost:8000/services/shop/consumers/app \
+     -H 'Content-Type: application/json' \
+     -d '{"dependencies":[{"operation":"GET /users","response":"200","fields":["profile.avatar"]}]}'
+curl localhost:8000/services/shop/release-check/1.0.0/2.0.0
+#   期望：verdict=reject，finding.reason_code=breaking_consumer_dependency_hit，
+#   命中路径 GET /users#response-200.profile
+```

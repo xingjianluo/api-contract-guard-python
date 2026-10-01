@@ -12,7 +12,16 @@
   该操作上任何破坏都命中它（行为与历史完全一致）；
 * 依赖级：登记 ``dependencies``（操作 + 响应状态码 + 字段路径集合），
   只有真正命中其所声明响应/字段的响应侧破坏才算命中；请求侧破坏
-  （调用方发不出合法请求）也会影响所有调用该操作的消费者。
+  （调用方发不出合法请求，含请求体整体必填收紧
+  ``request_body_required_added``）也会影响所有调用该操作的消费者。
+
+响应侧字段命中按点分路径的三个位置关系判定，任一成立即命中：
+
+* 声明字段就是变更字段本身；
+* 声明字段是变更字段的上层（如依赖 ``profile``，``profile.avatar`` 被删）；
+* 声明字段位于变更字段的下层（如依赖 ``profile.avatar``，而 ``profile``
+  整个对象被删除或整体改型）——依赖的内容随上层一起消失。
+  未声明依赖的响应/字段发生变化不会误算命中。
 
 每条破坏对应一个 finding，原因码三选一、互相可区分：
 
@@ -173,11 +182,14 @@ class ReleaseGate:
         section: str | None, change: Change
     ) -> bool:
         """请求侧（或端点级）破坏：调用方发不出合法请求，影响所有调用者。"""
+        # 请求体整体必填收紧的路径不带 section（挂在操作键上），按 kind 识别，
+        # 与“某个字段变必填”（request-body.<field> 路径）区分但同属请求侧破坏
+        if change.kind == "request_body_required_added":
+            return True
         if section is None:
             # 端点级破坏只有 endpoint_removed（BREAKING）
             return change.kind == "endpoint_removed"
-        return section in {"request-param", "request-body"} or \
-            change.kind == "request_body_required_added"
+        return section in {"request-param", "request-body"}
 
     @staticmethod
     def _split_change_path(path: str) -> tuple[str | None, str]:
@@ -223,8 +235,17 @@ class ReleaseGate:
         if not detail:
             return False
 
-        # detail 为点分字段路径；声明字段是破坏路径本身或其上层前缀即命中
-        return any(detail == f or detail.startswith(f + ".") for f in dep.fields)
+        # detail 为点分字段路径；以下三种位置关系都算命中：
+        # 1. 声明字段就是破坏路径本身（detail == f）；
+        # 2. 声明字段是破坏路径的上层（如依赖 profile，profile.avatar 被删）；
+        # 3. 声明字段位于破坏路径的下层（如依赖 profile.avatar，
+        #    而 profile 整个对象被删除或整体改型）——依赖的内容随上层一起没了。
+        return any(
+            detail == f
+            or detail.startswith(f + ".")
+            or f.startswith(detail + ".")
+            for f in dep.fields
+        )
 
 
 __all__ = ["ReleaseGate", "operation_key_of"]

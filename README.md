@@ -15,6 +15,11 @@
 - **请求体整体必填性入契**：`requestBody.required` 从“可以不带”变“必须带”判破坏
   （`request_body_required_added`），放宽为兼容（`request_body_required_relaxed`），
   与“某个字段从可选变必填”（`request_optional_to_required`）明确区分。
+  整体必填收紧属于请求侧破坏，**所有调用该操作的已登记消费者（含只登记响应
+  依赖的）都会被判命中并 reject**。
+- **嵌套字段依赖的整体命中**：消费者只声明依赖某响应里的嵌套字段
+  （如 `profile.avatar`）时，若新版本把上层对象 `profile` 整体删除或整体改型，
+  同样算命中其依赖内容并 reject；未声明依赖的响应/字段变化不会误算命中。
 - 依赖若指向不存在的操作 / 响应 / 字段，登记时即以三种可区分的错误码显式拒绝。
 
 ## 快速开始
